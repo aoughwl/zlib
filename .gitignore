@@ -1,0 +1,4 @@
+tests/vec/
+*.exe
+*.nimcache
+nimcache/

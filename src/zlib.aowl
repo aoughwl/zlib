@@ -1,0 +1,523 @@
+## zlib - DEFLATE (RFC 1951), zlib (RFC 1950) and gzip (RFC 1952), written from scratch in aowl.
+##
+## No C library, no dynlib: works wherever aowlmony does (Windows included). Status-based
+## results, never raises. Inflate handles stored, fixed and dynamic Huffman blocks and is
+## bounded by `maxSize`. Deflate does LZ77 (hash chains, 32 KiB window) with the fixed
+## Huffman code, falling back to stored blocks when that would be larger.
+##
+##   let z = zlibCompress("hello hello hello")
+##   let r = zlibDecompress(z)           # r.status == zOk, r.data == "hello hello hello"
+
+const
+  DefaultMaxSize* = 256 * 1024 * 1024
+  MaxBits = 15
+  WindowSize = 32768
+  MaxMatch = 258
+  MinMatch = 3
+
+type
+  ZStatus* = enum
+    zOk, zBadHeader, zBadData, zTruncated, zTooBig, zBadChecksum
+
+  ZResult* = object
+    status*: ZStatus
+    data*: string
+
+  Huff = object
+    count: seq[int]
+    symbol: seq[int]
+
+  InState = object
+    src: string
+    pos: int
+    bitbuf: int
+    bitcnt: int
+    dst: string
+    maxOut: int
+    err: ZStatus
+
+# ---- tables -------------------------------------------------------------------
+
+const
+  lbase = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+           67, 83, 99, 115, 131, 163, 195, 227, 258]
+  lext = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+          5, 5, 5, 5, 0]
+  dbase = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
+           769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+  dext = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+          11, 11, 12, 12, 13, 13]
+  clOrder = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+proc makeCrcTable(): seq[int] =
+  result = @[]
+  var n = 0
+  while n < 256:
+    var c = n
+    var k = 0
+    while k < 8:
+      if (c and 1) != 0: c = 0xEDB88320 xor (c shr 1)
+      else: c = c shr 1
+      inc k
+    result.add c
+    inc n
+
+let crcTable = makeCrcTable()
+
+proc crc32*(data: string; seed = 0): uint32 =
+  ## CRC-32 (IEEE) of `data`; pass the previous result as `seed` to continue.
+  var c = (int(seed) xor 0xFFFFFFFF) and 0xFFFFFFFF
+  for ch in data:
+    c = crcTable[(c xor ord(ch)) and 0xFF] xor (c shr 8)
+  uint32((c xor 0xFFFFFFFF) and 0xFFFFFFFF)
+
+proc adler32*(data: string): uint32 =
+  var a = 1
+  var b = 0
+  var i = 0
+  while i < data.len:
+    var stop = i + 5552
+    if stop > data.len: stop = data.len
+    while i < stop:
+      a += ord(data[i])
+      b += a
+      inc i
+    a = a mod 65521
+    b = b mod 65521
+  uint32((b shl 16) or a)
+
+# ---- inflate ------------------------------------------------------------------
+
+proc bits(s: var InState; need: int): int =
+  var val = s.bitbuf
+  while s.bitcnt < need:
+    if s.pos >= s.src.len:
+      s.err = zTruncated
+      return 0
+    val = val or (ord(s.src[s.pos]) shl s.bitcnt)
+    inc s.pos
+    s.bitcnt += 8
+  s.bitbuf = val shr need
+  s.bitcnt -= need
+  val and ((1 shl need) - 1)
+
+proc zeros(n: int): seq[int] =
+  result = @[]
+  var i = 0
+  while i < n:
+    result.add 0
+    inc i
+
+proc construct(h: var Huff; length: seq[int]; offset, n: int): int =
+  ## Build canonical decoding tables. 0 = complete, >0 = incomplete, <0 = over-subscribed.
+  h.count = zeros(MaxBits + 1)
+  var sym = 0
+  while sym < n:
+    inc h.count[length[offset + sym]]
+    inc sym
+  if h.count[0] == n: return 0
+  var left = 1
+  var len = 1
+  while len <= MaxBits:
+    left = left shl 1
+    left -= h.count[len]
+    if left < 0: return left
+    inc len
+  var offs = zeros(MaxBits + 2)
+  len = 1
+  while len < MaxBits:
+    offs[len + 1] = offs[len] + h.count[len]
+    inc len
+  h.symbol = zeros(n)
+  sym = 0
+  while sym < n:
+    let l = length[offset + sym]
+    if l != 0:
+      h.symbol[offs[l]] = sym
+      inc offs[l]
+    inc sym
+  left
+
+proc decodeSym(s: var InState; h: Huff): int =
+  var code = 0
+  var first = 0
+  var index = 0
+  var len = 1
+  while len <= MaxBits:
+    code = code or bits(s, 1)
+    if s.err != zOk: return -1
+    let count = h.count[len]
+    if code - count < first:
+      return h.symbol[index + (code - first)]
+    index += count
+    first += count
+    first = first shl 1
+    code = code shl 1
+    inc len
+  -1
+
+proc codes(s: var InState; lencode, distcode: Huff) =
+  while true:
+    var sym = decodeSym(s, lencode)
+    if s.err != zOk: return
+    if sym < 0:
+      s.err = zBadData
+      return
+    if sym < 256:
+      if s.dst.len >= s.maxOut:
+        s.err = zTooBig
+        return
+      s.dst.add char(sym)
+    elif sym == 256:
+      return
+    else:
+      sym -= 257
+      if sym >= 29:
+        s.err = zBadData
+        return
+      let len = lbase[sym] + bits(s, lext[sym])
+      if s.err != zOk: return
+      let ds = decodeSym(s, distcode)
+      if s.err != zOk: return
+      if ds < 0 or ds >= 30:
+        s.err = zBadData
+        return
+      let dist = dbase[ds] + bits(s, dext[ds])
+      if s.err != zOk: return
+      if dist > s.dst.len:
+        s.err = zBadData
+        return
+      if s.dst.len + len > s.maxOut:
+        s.err = zTooBig
+        return
+      var k = 0
+      var from0 = s.dst.len - dist
+      while k < len:
+        s.dst.add s.dst[from0 + k]
+        inc k
+
+proc storedBlock(s: var InState) =
+  s.bitbuf = 0
+  s.bitcnt = 0
+  if s.pos + 4 > s.src.len:
+    s.err = zTruncated
+    return
+  let len = ord(s.src[s.pos]) or (ord(s.src[s.pos + 1]) shl 8)
+  let nlen = ord(s.src[s.pos + 2]) or (ord(s.src[s.pos + 3]) shl 8)
+  if len != ((not nlen) and 0xFFFF):
+    s.err = zBadData
+    return
+  s.pos += 4
+  if s.pos + len > s.src.len:
+    s.err = zTruncated
+    return
+  if s.dst.len + len > s.maxOut:
+    s.err = zTooBig
+    return
+  var i = 0
+  while i < len:
+    s.dst.add s.src[s.pos + i]
+    inc i
+  s.pos += len
+
+proc fixedBlock(s: var InState) =
+  var lengths = zeros(288 + 30)
+  var i = 0
+  while i < 144:
+    lengths[i] = 8
+    inc i
+  while i < 256:
+    lengths[i] = 9
+    inc i
+  while i < 280:
+    lengths[i] = 7
+    inc i
+  while i < 288:
+    lengths[i] = 8
+    inc i
+  while i < 288 + 30:
+    lengths[i] = 5
+    inc i
+  var lencode = Huff(count: @[], symbol: @[])
+  var distcode = Huff(count: @[], symbol: @[])
+  discard construct(lencode, lengths, 0, 288)
+  discard construct(distcode, lengths, 288, 30)
+  codes(s, lencode, distcode)
+
+proc dynamicBlock(s: var InState) =
+  let nlen = bits(s, 5) + 257
+  let ndist = bits(s, 5) + 1
+  let ncode = bits(s, 4) + 4
+  if s.err != zOk: return
+  if nlen > 286 or ndist > 30:
+    s.err = zBadData
+    return
+  var lengths = zeros(320)
+  var idx = 0
+  while idx < ncode:
+    lengths[clOrder[idx]] = bits(s, 3)
+    inc idx
+  if s.err != zOk: return
+  var lencode = Huff(count: @[], symbol: @[])
+  var distcode = Huff(count: @[], symbol: @[])
+  if construct(lencode, lengths, 0, 19) != 0:
+    s.err = zBadData
+    return
+  idx = 0
+  lengths = zeros(320)
+  while idx < nlen + ndist:
+    var sym = decodeSym(s, lencode)
+    if s.err != zOk: return
+    if sym < 0:
+      s.err = zBadData
+      return
+    if sym < 16:
+      lengths[idx] = sym
+      inc idx
+    else:
+      var prev = 0
+      var rep = 0
+      if sym == 16:
+        if idx == 0:
+          s.err = zBadData
+          return
+        prev = lengths[idx - 1]
+        rep = 3 + bits(s, 2)
+      elif sym == 17:
+        rep = 3 + bits(s, 3)
+      else:
+        rep = 11 + bits(s, 7)
+      if s.err != zOk: return
+      if idx + rep > nlen + ndist:
+        s.err = zBadData
+        return
+      var r = 0
+      while r < rep:
+        lengths[idx] = prev
+        inc idx
+        inc r
+  if lengths[256] == 0:
+    s.err = zBadData
+    return
+  var e = construct(lencode, lengths, 0, nlen)
+  if e < 0 or (e > 0 and nlen - lencode.count[0] != 1):
+    s.err = zBadData
+    return
+  e = construct(distcode, lengths, nlen, ndist)
+  if e < 0 or (e > 0 and ndist - distcode.count[0] != 1):
+    s.err = zBadData
+    return
+  codes(s, lencode, distcode)
+
+proc inflateAt(src: string; start, maxSize: int; endPos: var int): ZResult =
+  var s = InState(src: src, pos: start, bitbuf: 0, bitcnt: 0, dst: "", maxOut: maxSize, err: zOk)
+  var last = 0
+  while last == 0 and s.err == zOk:
+    last = bits(s, 1)
+    let typ = bits(s, 2)
+    if s.err != zOk: break
+    if typ == 0: storedBlock(s)
+    elif typ == 1: fixedBlock(s)
+    elif typ == 2: dynamicBlock(s)
+    else: s.err = zBadData
+  endPos = s.pos
+  if s.err != zOk: return ZResult(status: s.err, data: "")
+  ZResult(status: zOk, data: s.dst)
+
+proc inflateRaw*(data: string; maxSize = DefaultMaxSize): ZResult =
+  ## Decompress a raw DEFLATE stream.
+  var e = 0
+  inflateAt(data, 0, maxSize, e)
+
+proc zlibDecompress*(data: string; maxSize = DefaultMaxSize): ZResult =
+  ## Decompress an RFC 1950 stream, verifying the Adler-32 trailer.
+  if data.len < 6: return ZResult(status: zTruncated, data: "")
+  let cmf = ord(data[0])
+  let flg = ord(data[1])
+  if (cmf and 0x0F) != 8 or ((cmf shl 8) + flg) mod 31 != 0 or (flg and 0x20) != 0:
+    return ZResult(status: zBadHeader, data: "")
+  var e = 0
+  var r = inflateAt(data, 2, maxSize, e)
+  if r.status != zOk: return r
+  if e + 4 > data.len: return ZResult(status: zTruncated, data: "")
+  let want = (ord(data[e]) shl 24) or (ord(data[e + 1]) shl 16) or (ord(data[e + 2]) shl 8) or ord(data[e + 3])
+  if int(adler32(r.data)) != want: return ZResult(status: zBadChecksum, data: "")
+  r
+
+proc gzipDecompress*(data: string; maxSize = DefaultMaxSize): ZResult =
+  ## Decompress an RFC 1952 member, verifying CRC-32 and the length trailer.
+  if data.len < 18 or ord(data[0]) != 0x1F or ord(data[1]) != 0x8B or ord(data[2]) != 8:
+    return ZResult(status: zBadHeader, data: "")
+  let flg = ord(data[3])
+  var p = 10
+  if (flg and 4) != 0:
+    if p + 2 > data.len: return ZResult(status: zTruncated, data: "")
+    p += 2 + (ord(data[p]) or (ord(data[p + 1]) shl 8))
+  if (flg and 8) != 0:
+    while p < data.len and data[p] != '\0': inc p
+    inc p
+  if (flg and 16) != 0:
+    while p < data.len and data[p] != '\0': inc p
+    inc p
+  if (flg and 2) != 0: p += 2
+  if p >= data.len: return ZResult(status: zTruncated, data: "")
+  var e = 0
+  var r = inflateAt(data, p, maxSize, e)
+  if r.status != zOk: return r
+  if e + 8 > data.len: return ZResult(status: zTruncated, data: "")
+  let crc = ord(data[e]) or (ord(data[e + 1]) shl 8) or (ord(data[e + 2]) shl 16) or (ord(data[e + 3]) shl 24)
+  let isz = ord(data[e + 4]) or (ord(data[e + 5]) shl 8) or (ord(data[e + 6]) shl 16) or (ord(data[e + 7]) shl 24)
+  if int(crc32(r.data)) != crc or (r.data.len and 0xFFFFFFFF) != isz:
+    return ZResult(status: zBadChecksum, data: "")
+  r
+
+# ---- deflate ------------------------------------------------------------------
+
+type BitWriter = object
+  dst: string
+  buf: int
+  cnt: int
+
+proc putBits(w: var BitWriter; value, n: int) =
+  w.buf = w.buf or (value shl w.cnt)
+  w.cnt += n
+  while w.cnt >= 8:
+    w.dst.add char(w.buf and 0xFF)
+    w.buf = w.buf shr 8
+    w.cnt -= 8
+
+proc flushBits(w: var BitWriter) =
+  if w.cnt > 0:
+    w.dst.add char(w.buf and 0xFF)
+  w.buf = 0
+  w.cnt = 0
+
+proc putCode(w: var BitWriter; code, len: int) =
+  ## Huffman codes go out most-significant bit first.
+  var rev = 0
+  var i = 0
+  while i < len:
+    rev = (rev shl 1) or ((code shr i) and 1)
+    inc i
+  putBits(w, rev, len)
+
+proc putLitLen(w: var BitWriter; sym: int) =
+  if sym < 144: putCode(w, 0x30 + sym, 8)
+  elif sym < 256: putCode(w, 0x190 + (sym - 144), 9)
+  elif sym < 280: putCode(w, sym - 256, 7)
+  else: putCode(w, 0xC0 + (sym - 280), 8)
+
+proc putMatch(w: var BitWriter; len, dist: int) =
+  var ls = 28
+  while ls > 0 and lbase[ls] > len: dec ls
+  putLitLen(w, 257 + ls)
+  if lext[ls] > 0: putBits(w, len - lbase[ls], lext[ls])
+  var ds = 29
+  while ds > 0 and dbase[ds] > dist: dec ds
+  putCode(w, ds, 5)
+  if dext[ds] > 0: putBits(w, dist - dbase[ds], dext[ds])
+
+proc storedStream(data: string): string =
+  var w = BitWriter(dst: "", buf: 0, cnt: 0)
+  var pos = 0
+  if data.len == 0:
+    w.dst.add "\x01\x00\x00\xFF\xFF"
+    return w.dst
+  while pos < data.len:
+    var n = data.len - pos
+    if n > 65535: n = 65535
+    let final = if pos + n >= data.len: 1 else: 0
+    w.dst.add char(final)
+    w.dst.add char(n and 0xFF)
+    w.dst.add char(n shr 8)
+    w.dst.add char((not n) and 0xFF)
+    w.dst.add char(((not n) shr 8) and 0xFF)
+    var i = 0
+    while i < n:
+      w.dst.add data[pos + i]
+      inc i
+    pos += n
+  w.dst
+
+proc hash3(data: string; i: int): int =
+  ((ord(data[i]) shl 10) xor (ord(data[i + 1]) shl 5) xor ord(data[i + 2])) and 0x7FFF
+
+proc deflateRaw*(data: string; level = 6): string =
+  ## Raw DEFLATE. level 0 = stored; 1..9 = LZ77 (longer hash chains at higher levels)
+  ## with the fixed Huffman code. Never larger than stored.
+  if level <= 0 or data.len < 16: return storedStream(data)
+  var chain = 8
+  if level >= 3: chain = 32
+  if level >= 6: chain = 128
+  if level >= 9: chain = 1024
+  var head = zeros(32768)
+  var i = 0
+  while i < head.len:
+    head[i] = -1
+    inc i
+  var prev = zeros(data.len)
+  var w = BitWriter(dst: "", buf: 0, cnt: 0)
+  putBits(w, 1, 1)   # final block
+  putBits(w, 1, 2)   # fixed Huffman
+  var pos = 0
+  while pos < data.len:
+    var bestLen = 0
+    var bestDist = 0
+    if pos + MinMatch <= data.len:
+      let h = hash3(data, pos)
+      var cand = head[h]
+      var tries = chain
+      while cand >= 0 and tries > 0 and pos - cand <= WindowSize:
+        var l = 0
+        let maxL = if data.len - pos < MaxMatch: data.len - pos else: MaxMatch
+        while l < maxL and data[cand + l] == data[pos + l]: inc l
+        if l > bestLen:
+          bestLen = l
+          bestDist = pos - cand
+          if l >= maxL: break
+        cand = prev[cand]
+        dec tries
+    var step = 1
+    if bestLen >= MinMatch:
+      putMatch(w, bestLen, bestDist)
+      step = bestLen
+    else:
+      putLitLen(w, ord(data[pos]))
+    var k = 0
+    while k < step:
+      if pos + MinMatch <= data.len:
+        let h = hash3(data, pos)
+        prev[pos] = head[h]
+        head[h] = pos
+      inc pos
+      inc k
+  putLitLen(w, 256)
+  flushBits(w)
+  let storedSize = data.len + 5 * ((data.len + 65534) div 65535)
+  if w.dst.len >= storedSize: return storedStream(data)
+  w.dst
+
+proc zlibCompress*(data: string; level = 6): string =
+  result = ""
+  result.add char(0x78)
+  result.add char(if level <= 1: 0x01 elif level >= 9: 0xDA else: 0x9C)
+  result.add deflateRaw(data, level)
+  let a = int(adler32(data))
+  result.add char((a shr 24) and 0xFF)
+  result.add char((a shr 16) and 0xFF)
+  result.add char((a shr 8) and 0xFF)
+  result.add char(a and 0xFF)
+
+proc gzipCompress*(data: string; level = 6): string =
+  result = "\x1F\x8B\x08\x00\x00\x00\x00\x00\x00\xFF"
+  result.add deflateRaw(data, level)
+  let c = int(crc32(data))
+  let n = data.len and 0xFFFFFFFF
+  result.add char(c and 0xFF)
+  result.add char((c shr 8) and 0xFF)
+  result.add char((c shr 16) and 0xFF)
+  result.add char((c shr 24) and 0xFF)
+  result.add char(n and 0xFF)
+  result.add char((n shr 8) and 0xFF)
+  result.add char((n shr 16) and 0xFF)
+  result.add char((n shr 24) and 0xFF)

@@ -1,0 +1,65 @@
+import std/syncio
+import zlib
+
+var failed = 0
+var total = 0
+
+proc slurp(path: string): string =
+  result = ""
+  try:
+    result = readFile(path)
+  except:
+    result = ""
+
+proc spit(path, data: string) =
+  try:
+    writeFile(path, data)
+  except:
+    echo "cannot write ", path
+
+proc check(ok: bool; what: string) =
+  inc total
+  if not ok:
+    echo "FAIL ", what
+    inc failed
+
+let names = slurp("vec/cases.txt")
+var start = 0
+var cases: seq[string] = @[]
+var i = 0
+while i <= names.len:
+  if i == names.len or names[i] == '\n':
+    if i > start: cases.add names.substr(start, i - 1)
+    start = i + 1
+  inc i
+
+for name in cases:
+  let orig = slurp("vec/" & name & ".orig")
+  for lv in ["0", "1", "6", "9"]:
+    let a = zlibDecompress(slurp("vec/" & name & ".z" & lv))
+    check(a.status == zOk and a.data == orig, name & " zlib level " & lv & " status=" & $a.status)
+    let b = inflateRaw(slurp("vec/" & name & ".raw" & lv))
+    check(b.status == zOk and b.data == orig, name & " raw level " & lv & " status=" & $b.status)
+  let g = gzipDecompress(slurp("vec/" & name & ".gz"))
+  check(g.status == zOk and g.data == orig, name & " gzip status=" & $g.status)
+  for lv in [0, 1, 6, 9]:
+    let z = zlibCompress(orig, lv)
+    spit("vec/" & name & ".ours.z" & $lv, z)
+    spit("vec/" & name & ".ours.raw" & $lv, deflateRaw(orig, lv))
+    let back = zlibDecompress(z)
+    check(back.status == zOk and back.data == orig, name & " our roundtrip level " & $lv)
+  spit("vec/" & name & ".ours.gz", gzipCompress(orig))
+  check(gzipDecompress(gzipCompress(orig)).data == orig, name & " our gzip roundtrip")
+
+# corruption is detected, never a crash
+let good = zlibCompress("some data to corrupt, some data to corrupt")
+var bad = good
+bad[bad.len - 1] = char(ord(bad[bad.len - 1]) xor 0xFF)
+check(zlibDecompress(bad).status == zBadChecksum, "bad adler detected")
+check(zlibDecompress(good.substr(0, good.len - 5)).status != zOk, "truncation detected")
+check(zlibDecompress("not zlib at all").status == zBadHeader, "bad header detected")
+check(inflateRaw(slurp("vec/zeros.raw9"), 1000).status == zTooBig, "maxSize enforced")
+check(crc32("123456789") == 0xCBF43926'u32, "crc32 check value")
+check(adler32("Wikipedia") == 0x11E60398'u32, "adler32 check value")
+echo total - failed, "/", total, " passed"
+if failed > 0: quit(1)

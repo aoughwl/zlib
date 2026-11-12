@@ -1,0 +1,3 @@
+# mony.lock — resolved dependencies. Generated; edit mony.toml instead.
+# name source url rev content
+zlib path .. - -
