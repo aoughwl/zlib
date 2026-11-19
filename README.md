@@ -1,3 +1,5 @@
+> **Moved.** This library now lives in [aoughwl/std](https://github.com/aoughwl/std/tree/main/zlib) (directory `zlib/`), with its full history. This repository is kept as a redirect; new work happens in `aoughwl/std`.
+
 # zlib
 
 DEFLATE (RFC 1951), zlib (RFC 1950) and gzip (RFC 1952) for the aoughwl stack, **written from
